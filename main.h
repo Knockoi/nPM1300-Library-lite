@@ -1,6 +1,6 @@
 // nPM1300 Library for Arduino and nRF SDK/Zephyr RTOS
-// Author: Grok 4 (xAI) - Generated based on user specifications
-// Version: 1.0
+// Author: Grok 4 (xAI) - Generated based on user specifications, updated with corrections
+// Version: 1.1
 // Date: September 18, 2025
 //
 // This library provides a flexible interface to control the Nordic nPM1300 PMIC via I2C.
@@ -32,8 +32,17 @@
 // - Simple voltage-based SOC estimation with temperature compensation.
 // - Coulomb counting for current integration (update periodically in loop).
 // - Battery health (SOH) estimated based on cycle count and capacity fade (simplified model).
+// - For better accuracy, consider implementing a lookup table based on battery discharge curve.
 //
 // Error Reporting: All functions return error codes (0 = success).
+//
+// Changes in v1.1:
+// - Updated register bases and offsets based on Zephyr driver.
+// - Updated voltage encoding for Bucks and LDOs to 1.0V base, 0.1V steps.
+// - Fixed getVbusVoltage and getBatteryCurrent MSB registers.
+// - Implemented multi-byte I2C functions.
+// - Added placeholders for charge status and error reading.
+// - Kept charger and GPIO values as examples; verify with datasheet for exact values.
 
 #ifndef NPM1300_H
 #define NPM1300_H
@@ -57,10 +66,15 @@
 // nPM1300 I2C Address
 #define NPM1300_I2C_ADDR 0x6B
 
-// Register Bases (from provided datasheet snippet)
-#define ADC_BASE 0x05  // High byte for ADC group (0x0500 internal, but I2C uses 8-bit reg addr)
+// Register Bases (from Zephyr driver and datasheet)
+#define ADC_BASE 0x05
+#define BUCK_BASE 0x04
+#define GPIO_BASE 0x06
+#define LDO_BASE 0x08
+#define CHARGER_BASE 0x03  // Assumed; verify with datasheet
+#define SHPHLD_BASE 0x0B
 
-// Key Registers (extracted and generalized from datasheet)
+// Key Registers for ADC (from original, assumed correct)
 #define TASK_VBAT_MEASURE 0x00
 #define TASK_NTC_MEASURE 0x01
 #define TASK_TEMP_MEASURE 0x02
@@ -78,27 +92,29 @@
 #define ADC_TEMP_RESULT_MSB 0x13
 #define ADC_VSYS_RESULT_MSB 0x14
 #define ADC_GP0_RESULT_LSBS 0x15
+#define ADC_IBAT_RESULT_MSB 0x16  // Assumed based on pattern
+#define ADC_VBUS_RESULT_MSB 0x17  // Assumed based on pattern
 #define ADC_IBAT_MEAS_EN 0x24
 
-// Charger Registers (generalized; assume standard Nordic offsets - user to verify full datasheet)
-#define CHG_TERM_VOLT 0x20  // Example offset for termination voltage
-#define CHG_CURR_LIMIT 0x21 // Example for charge current
+// Charger Registers (example offsets; verify with datasheet)
+#define CHG_TERM_VOLT 0x20  // Example
+#define CHG_CURR_LIMIT 0x21 // Example
+#define CHG_STATUS 0x22     // Assumed for status
+#define ERR_STATUS 0x23     // Assumed for error status
 
-// Buck/LDO Registers (example offsets; based on typical PMIC structure)
-#define BUCK1_VSET 0x30
-#define BUCK2_VSET 0x31
-#define LDO1_VSET 0x40
-#define LDO1_EN 0x41
-#define LDO2_VSET 0x42
-#define LDO2_EN 0x43
+// Buck Registers (from Zephyr)
+#define BUCK_EN_SET 0x00    // Offset for EN_SET (Buck1), Buck2 +0x02
+#define BUCK_VOUT_NORM 0x08 // Offset for VOUT_NORMAL (Buck1), Buck2 +0x02
 
-// GPIO Registers
-#define GPIO1_CFG 0x50
-#define GPIO2_CFG 0x51
-#define GPIO3_CFG 0x52
+// LDO Registers (from Zephyr)
+#define LDO_EN_SET 0x00     // Offset for EN_SET (LDO1), LDO2 +0x02
+#define LDO_VOUT_SEL 0x0C   // Offset for VOUTSEL (LDO1), LDO2 +0x01
+
+// GPIO Registers (from Zephyr)
+#define GPIO_MODE 0x00      // Offset + pin for mode
 
 // SHPHLD_B Config (Power Button)
-#define SHPHLD_CFG 0x60  // Short press wake, long press shutdown
+#define SHPHLD_CFG 0x00     // Example offset; verify
 
 // Constants from Datasheet
 #define VFS_VBAT 5.0f
@@ -144,14 +160,14 @@ public:
   void setChargeCurrent(float current_mA);              // e.g., 100mA for 500mAh battery (0.2C)
   void setNtcResistance(NtcResistance res);
   void setBatteryCapacity(float capacity_mAh);          // For fuel gauge
-  void setNtcBeta(uint16_t beta);                       // NTC beta parameter
+  void setNtcBeta(uint16_t beta);                      // NTC beta parameter
 
-  // GPIO Config
+  // GPIO Config (value is example; verify datasheet for exact mode codes)
   void configGpio1AsInt();
   void configGpio2AsDrvEn();
   void configGpio3AsDrvPwm();
 
-  // Power Button Config
+  // Power Button Config (value is example; verify)
   void configShphldAsPowerButton();  // Short press wake, long press shutdown
 
   // Measurements (low power: single-shot by default)
@@ -194,7 +210,7 @@ private:
   uint16_t ntcBeta = NTC_BETA_DEFAULT;
 
   // Helper Functions
-  void triggerMeasurement(uint8_t taskReg);
+  void triggerMeasurement(uint8_t taskOffset); // Offset relative to ADC_BASE
   uint16_t readAdcResult(uint8_t msbReg, uint8_t lsbReg, uint8_t lsbShift);
   float calculateVbat(uint16_t adcVal);
   float calculateIbat(uint16_t adcVal, bool charging);
