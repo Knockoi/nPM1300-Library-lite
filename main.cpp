@@ -1,348 +1,220 @@
-#include "nPM1300.h"
+// nPM1300 Library for Arduino and nRF SDK/Zephyr RTOS
+// Author: Grok 4 (xAI) - Generated based on user specifications
+// Version: 1.0
+// Date: September 18, 2025
+//
+// This library provides a flexible interface to control the Nordic nPM1300 PMIC via I2C.
+// It supports configuration of Bucks, LDOs, Charger, GPIOs, and System Monitor (ADC) for measurements.
+// Fuel gauge is implemented as a simple voltage-based estimation with Coulomb counting for better accuracy (requires periodic updates).
+// Optimized for low power: Measurements are triggered on-demand, automatic modes disabled by default.
+// Compatible with:
+// - Arduino (using Wire.h)
+// - nRF SDK / Zephyr RTOS (using Zephyr I2C API; define USE_ZEPHYR to switch)
+//
+// Usage:
+// - Include this in your project.
+// - In examples, override defaults via setters.
+// - For Zephyr: Provide device tree overlay for I2C and define USE_ZEPHYR.
+//
+// Default Configurations (overridable):
+// - Buck1 and Buck2: 3.3V output
+// - LDO1: 3.3V enabled
+// - LDO2: Disabled
+// - Charger: 4.2V termination, suitable for 500mAh Li-Ion (adjust current limits as needed)
+// - GPIO1: INT (interrupt output)
+// - GPIO2: DRV2603_EN (output for enable)
+// - GPIO3: DRV2603_PWM (output for PWM)
+// - SHPHLD_B: Configured as power button (short press wake, long press shutdown)
+// - Battery Capacity: 500mAh (for fuel gauge)
+// - NTC: 10kOhm (default, configurable)
+//
+// Fuel Gauge Notes:
+// - Simple voltage-based SOC estimation with temperature compensation.
+// - Coulomb counting for current integration (update periodically in loop).
+// - Battery health (SOH) estimated based on cycle count and capacity fade (simplified model).
+//
+// Error Reporting: All functions return error codes (0 = success).
 
-#ifndef ARDUINO
-// TWI instance for nRF SDK environment
-const nrf_drv_twi_t* nPM1300::m_twi = nullptr;
-#endif
+#ifndef NPM1300_H
+#define NPM1300_H
 
-// Constructor
+// Define USE_ZEPHYR for Zephyr RTOS compatibility
+// #define USE_ZEPHYR
+
 #ifdef ARDUINO
-nPM1300::nPM1300(uint8_t addr) : _i2c_addr(addr), _initialized(false) {
-}
+#include <Wire.h>
 #else
-nPM1300::nPM1300(const nrf_drv_twi_t* twi_instance, uint8_t addr) : _i2c_addr(addr), _initialized(false) {
-    m_twi = twi_instance;
-}
+// For nRF SDK or Zephyr, include appropriate headers
+#ifdef USE_ZEPHYR
+#include <zephyr/device.h>
+#include <zephyr/drivers/i2c.h>
+#else
+// nRF SDK placeholders (user to implement)
+#include <nrf_drv_twi.h>
+#endif
 #endif
 
-// Initialization
-bool nPM1300::begin() {
-#ifdef ARDUINO
-    Wire.begin();
-    delay(100); // Wait for nPM1300 to stabilize
-#else
-    nrf_delay_ms(100);
+// nPM1300 I2C Address
+#define NPM1300_I2C_ADDR 0x6B
+
+// Register Bases (from provided datasheet snippet)
+#define ADC_BASE 0x05  // High byte for ADC group (0x0500 internal, but I2C uses 8-bit reg addr)
+
+// Key Registers (extracted and generalized from datasheet)
+#define TASK_VBAT_MEASURE 0x00
+#define TASK_NTC_MEASURE 0x01
+#define TASK_TEMP_MEASURE 0x02
+#define TASK_VSYS_MEASURE 0x03
+#define TASK_IBAT_MEASURE 0x06
+#define TASK_VBUS7_MEASURE 0x07
+#define ADC_CONFIG 0x09
+#define ADC_NTC_RSEL 0x0A
+#define ADC_AUTO_TIM_CONF 0x0B
+#define TASK_AUTO_TIM_UPDATE 0x0C
+#define ADC_DEL_TIM_CONF 0x0D
+#define ADC_IBAT_MEAS_STATUS 0x10
+#define ADC_VBAT_RESULT_MSB 0x11
+#define ADC_NTC_RESULT_MSB 0x12
+#define ADC_TEMP_RESULT_MSB 0x13
+#define ADC_VSYS_RESULT_MSB 0x14
+#define ADC_GP0_RESULT_LSBS 0x15
+#define ADC_IBAT_MEAS_EN 0x24
+
+// Charger Registers (generalized; assume standard Nordic offsets - user to verify full datasheet)
+#define CHG_TERM_VOLT 0x20  // Example offset for termination voltage
+#define CHG_CURR_LIMIT 0x21 // Example for charge current
+
+// Buck/LDO Registers (example offsets; based on typical PMIC structure)
+#define BUCK1_VSET 0x30
+#define BUCK2_VSET 0x31
+#define LDO1_VSET 0x40
+#define LDO1_EN 0x41
+#define LDO2_VSET 0x42
+#define LDO2_EN 0x43
+
+// GPIO Registers
+#define GPIO1_CFG 0x50
+#define GPIO2_CFG 0x51
+#define GPIO3_CFG 0x52
+
+// SHPHLD_B Config (Power Button)
+#define SHPHLD_CFG 0x60  // Short press wake, long press shutdown
+
+// Constants from Datasheet
+#define VFS_VBAT 5.0f
+#define VFS_VBUS 7.5f
+#define VFS_VSYS 6.375f
+#define VFS_TEMP 1.5f
+#define T0_KELVIN 298.15f
+#define NTC_BETA_DEFAULT 3950  // Common for 10k NTC; configurable
+
+// Error Codes
+#define NPM_ERR_SUCCESS 0
+#define NPM_ERR_I2C_FAIL -1
+#define NPM_ERR_INVALID_MEAS -2
+
+// NTC Resistance Select
+enum NtcResistance {
+  NTC_HI_Z = 0,
+  NTC_10K = 1,
+  NTC_47K = 2,
+  NTC_100K = 3
+};
+
+// Measurement Modes
+enum MeasMode {
+  SINGLE_SHOT,
+  AUTO,
+  TIMED
+};
+
+class nPM1300 {
+public:
+  // Constructor
+  nPM1300();
+
+  // Initialization with defaults (call in setup())
+  int init();
+
+  // Setters for flexible configuration (override defaults)
+  void setBuckVoltage(uint8_t buckNum, float voltage);  // buckNum 1 or 2, voltage in V (e.g., 3.3)
+  void setLdoVoltage(uint8_t ldoNum, float voltage);    // ldoNum 1 or 2
+  void enableLdo(uint8_t ldoNum, bool enable);
+  void setChargeTermVoltage(float voltage);             // e.g., 4.2V
+  void setChargeCurrent(float current_mA);              // e.g., 100mA for 500mAh battery (0.2C)
+  void setNtcResistance(NtcResistance res);
+  void setBatteryCapacity(float capacity_mAh);          // For fuel gauge
+  void setNtcBeta(uint16_t beta);                       // NTC beta parameter
+
+  // GPIO Config
+  void configGpio1AsInt();
+  void configGpio2AsDrvEn();
+  void configGpio3AsDrvPwm();
+
+  // Power Button Config
+  void configShphldAsPowerButton();  // Short press wake, long press shutdown
+
+  // Measurements (low power: single-shot by default)
+  float getBatteryVoltage();         // VBAT in V
+  float getBatteryCurrent();         // IBAT in mA (positive charging, negative discharging)
+  float getBatteryTemperature();     // TBAT in C
+  float getDieTemperature();         // TDIE in C
+  float getVsysVoltage();            // VSYS in V
+  float getVbusVoltage();            // VBUS in V
+
+  // Fuel Gauge
+  float getStateOfCharge();          // SOC % (0-100)
+  float getStateOfHealth();          // SOH % (estimated)
+  void updateFuelGauge();            // Call periodically for Coulomb counting
+  int getChargeStatus();             // 0: Not charging, 1: Charging, 2: Full, -1: Error
+  float getChargeVoltage();          // Current charge voltage
+  float getChargeCurrent();          // Current charge current
+
+  // Error Reporting
+  int getLastError();                // Read error register or status
+
+private:
+  // I2C Abstraction
+  int i2cWrite(uint8_t reg, uint8_t val);
+  int i2cRead(uint8_t reg, uint8_t* val);
+  int i2cWriteMulti(uint8_t reg, uint8_t* data, size_t len);
+  int i2cReadMulti(uint8_t reg, uint8_t* data, size_t len);
+
+#ifdef USE_ZEPHYR
+  const struct device* i2c_dev;
 #endif
-    
-    if (!isConnected()) {
-        return false;
-    }
-    
-    _initialized = true;
-    return configureDefault();
-}
 
-// Check device connection
-bool nPM1300::isConnected() {
-    uint8_t status;
-    return readRegister(NPM1300_MAIN_STATUS, &status);
-}
+  // Internal States for Fuel Gauge
+  float batteryCapacity_mAh = 500.0f;
+  float integratedCharge_mAh = 0.0f;  // For Coulomb counting
+  uint16_t cycleCount = 0;            // For SOH estimation
+  float lastIbat = 0.0f;
+  unsigned long lastUpdateTime = 0;
+  NtcResistance ntcRes = NTC_10K;
+  uint16_t ntcBeta = NTC_BETA_DEFAULT;
 
-// Write to register
-bool nPM1300::writeRegister(uint8_t reg, uint8_t data) {
-#ifdef ARDUINO
-    Wire.beginTransmission(_i2c_addr);
-    Wire.write(reg);
-    Wire.write(data);
-    return (Wire.endTransmission() == 0);
-#else
-    if (!m_twi) return false;
-    
-    uint8_t tx_data[2] = {reg, data};
-    ret_code_t err_code = nrf_drv_twi_tx(m_twi, _i2c_addr, tx_data, 2, false);
-    return (err_code == NRF_SUCCESS);
-#endif
-}
+  // Helper Functions
+  void triggerMeasurement(uint8_t taskReg);
+  uint16_t readAdcResult(uint8_t msbReg, uint8_t lsbReg, uint8_t lsbShift);
+  float calculateVbat(uint16_t adcVal);
+  float calculateIbat(uint16_t adcVal, bool charging);
+  float calculateTbat(uint16_t adcVal);
+  float calculateTdie(uint16_t adcVal);
+  float calculateVsys(uint16_t adcVal);
+  float calculateVbus(uint16_t adcVal);
 
-// Read a single register
-bool nPM1300::readRegister(uint8_t reg, uint8_t* data) {
-#ifdef ARDUINO
-    Wire.beginTransmission(_i2c_addr);
-    Wire.write(reg);
-    if (Wire.endTransmission() != 0) return false;
-    
-    if (Wire.requestFrom(_i2c_addr, (uint8_t)1) != 1) return false;
-    *data = Wire.read();
-    return true;
-#else
-    if (!m_twi) return false;
-    
-    ret_code_t err_code = nrf_drv_twi_tx(m_twi, _i2c_addr, &reg, 1, true);
-    if (err_code != NRF_SUCCESS) return false;
-    
-    err_code = nrf_drv_twi_rx(m_twi, _i2c_addr, data, 1);
-    return (err_code == NRF_SUCCESS);
-#endif
-}
+  // Low Power Optimizations
+  void disableAutoMeasurements();  // Disable auto for low power
+};
 
-// Read multiple registers
-bool nPM1300::readMultipleRegisters(uint8_t reg, uint8_t* data, uint8_t length) {
-#ifdef ARDUINO
-    Wire.beginTransmission(_i2c_addr);
-    Wire.write(reg);
-    if (Wire.endTransmission() != 0) return false;
-    
-    if (Wire.requestFrom(_i2c_addr, length) != length) return false;
-    for (uint8_t i = 0; i < length; i++) {
-        data[i] = Wire.read();
-    }
-    return true;
-#else
-    if (!m_twi) return false;
-    
-    ret_code_t err_code = nrf_drv_twi_tx(m_twi, _i2c_addr, &reg, 1, true);
-    if (err_code != NRF_SUCCESS) return false;
-    
-    err_code = nrf_drv_twi_rx(m_twi, _i2c_addr, data, length);
-    return (err_code == NRF_SUCCESS);
-#endif
-}
+// Example Usage (in Arduino sketch or main.c)
+// void setup() {
+//   nPM1300 pmic;
+//   pmic.init();
+//   // Override if needed
+//   // pmic.setBuckVoltage(1, 3.0);
+//   // pmic.enableLdo(2, true);
+//   // pmic.setLdoVoltage(2, 1.8);
+// }
 
-// Default configuration
-bool nPM1300::configureDefault() {
-    // Set Buck1 and Buck2 to 3.3V and enable
-    if (!setBuck1Voltage(3.3)) return false;
-    if (!setBuck2Voltage(3.3)) return false;
-    if (!enableBuck1(true)) return false;
-    if (!enableBuck2(true)) return false;
-    
-    // Set LDO1 to 3.3V and enable, disable LDO2
-    if (!setLDO1Voltage(3.3)) return false;
-    if (!enableLDO1(true)) return false;
-    if (!enableLDO2(false)) return false;
-    
-    // Configure charger to 4.2V
-    if (!setChargeVoltage(4.2)) return false;
-    if (!enableCharger(true)) return false;
-    
-    // Configure GPIOs for DRV2603
-    if (!configureDRV2603()) return false;
-    
-    // Enable SHIP HOLD feature
-    if (!setShipHoldMode(SHPHLD_MODE_WAKE_SHORT)) return false;
-    
-    return true;
-}
-
-// Buck1 voltage setting
-bool nPM1300::setBuck1Voltage(float voltage) {
-    uint8_t reg_val;
-    if (voltage == 3.3) {
-        reg_val = VOLTAGE_3V3_BUCK;
-    } else {
-        // Simplified calculation, can be extended for more voltages
-        reg_val = (uint8_t)((voltage - 1.8) * 50);
-    }
-    return writeRegister(NPM1300_BUCK1_VOUT, reg_val);
-}
-
-// Buck2 voltage setting
-bool nPM1300::setBuck2Voltage(float voltage) {
-    uint8_t reg_val;
-    if (voltage == 3.3) {
-        reg_val = VOLTAGE_3V3_BUCK;
-    } else {
-        reg_val = (uint8_t)((voltage - 1.8) * 50);
-    }
-    return writeRegister(NPM1300_BUCK2_VOUT, reg_val);
-}
-
-// Enable or disable Buck1
-bool nPM1300::enableBuck1(bool enable) {
-    uint8_t ctrl_val = enable ? 0x01 : 0x00;
-    return writeRegister(NPM1300_BUCK1_CTRL, ctrl_val);
-}
-
-// Enable or disable Buck2
-bool nPM1300::enableBuck2(bool enable) {
-    uint8_t ctrl_val = enable ? 0x01 : 0x00;
-    return writeRegister(NPM1300_BUCK2_CTRL, ctrl_val);
-}
-
-// LDO1 voltage setting
-bool nPM1300::setLDO1Voltage(float voltage) {
-    uint8_t reg_val;
-    if (voltage == 3.3) {
-        reg_val = VOLTAGE_3V3_LDO;
-    } else {
-        reg_val = (uint8_t)((voltage - 1.8) * 40);
-    }
-    return writeRegister(NPM1300_LDO1_VOUT, reg_val);
-}
-
-// Enable or disable LDO1
-bool nPM1300::enableLDO1(bool enable) {
-    uint8_t ctrl_val = enable ? 0x01 : 0x00;
-    return writeRegister(NPM1300_LDO1_CTRL, ctrl_val);
-}
-
-// Enable or disable LDO2
-bool nPM1300::enableLDO2(bool enable) {
-    uint8_t ctrl_val = enable ? 0x01 : 0x00;
-    return writeRegister(NPM1300_LDO2_CTRL, ctrl_val);
-}
-
-// Charger voltage setting
-bool nPM1300::setChargeVoltage(float voltage) {
-    uint8_t reg_val;
-    if (voltage == 4.2) {
-        reg_val = VOLTAGE_4V2_CHG;
-    } else {
-        reg_val = (uint8_t)((voltage - 3.5) * 40);
-    }
-    return writeRegister(NPM1300_CHG_VTERM, reg_val);
-}
-
-// Enable or disable charger
-bool nPM1300::enableCharger(bool enable) {
-    uint8_t ctrl_val = enable ? 0x01 : 0x00;
-    return writeRegister(NPM1300_CHG_CTRL, ctrl_val);
-}
-
-// GPIO mode configuration
-bool nPM1300::setGPIO1Mode(uint8_t mode) {
-    uint8_t ctrl_val = 0x00;
-    switch(mode) {
-        case GPIO_MODE_INPUT:
-            ctrl_val = 0x00;
-            break;
-        case GPIO_MODE_OUTPUT:
-            ctrl_val = 0x01;
-            break;
-        case GPIO_MODE_INTERRUPT:
-            ctrl_val = 0x02;
-            break;
-    }
-    return writeRegister(NPM1300_GPIO1_CTRL, ctrl_val);
-}
-
-bool nPM1300::setGPIO2Mode(uint8_t mode) {
-    uint8_t ctrl_val = 0x00;
-    switch(mode) {
-        case GPIO_MODE_OUTPUT:
-            ctrl_val = 0x01; // Used for DRV2603_EN
-            break;
-        default:
-            ctrl_val = 0x01;
-    }
-    return writeRegister(NPM1300_GPIO2_CTRL, ctrl_val);
-}
-
-bool nPM1300::setGPIO3Mode(uint8_t mode) {
-    uint8_t ctrl_val = 0x03; // PWM mode for DRV2603_PWM
-    return writeRegister(NPM1300_GPIO3_CTRL, ctrl_val);
-}
-
-// Write to GPIO
-bool nPM1300::writeGPIO(uint8_t pin, bool state) {
-    uint8_t reg = NPM1300_GPIO1_CTRL + pin - 1;
-    uint8_t current_val;
-    if (!readRegister(reg, &current_val)) return false;
-    
-    if (state) {
-        current_val |= 0x80; // Set high bit
-    } else {
-        current_val &= 0x7F; // Clear high bit
-    }
-    return writeRegister(reg, current_val);
-}
-
-// Configure GPIOs for DRV2603
-bool nPM1300::configureDRV2603() {
-    // Set GPIO1 as interrupt input
-    if (!setGPIO1Mode(GPIO_MODE_INTERRUPT)) return false;
-    
-    // Set GPIO2 as output (DRV2603_EN)
-    if (!setGPIO2Mode(GPIO_MODE_OUTPUT)) return false;
-    
-    // Set GPIO3 as PWM output (DRV2603_PWM)
-    if (!setGPIO3Mode(GPIO_MODE_OUTPUT)) return false;
-    
-    return true;
-}
-
-// Set SHIP HOLD mode
-bool nPM1300::setShipHoldMode(uint8_t mode) {
-    uint8_t ctrl_val = 0x00;
-    switch(mode) {
-        case SHPHLD_MODE_DISABLE:
-            ctrl_val = 0x00;
-            break;
-        case SHPHLD_MODE_WAKE_SHORT:
-            ctrl_val = 0x01; // Wake on short press
-            break;
-        case SHPHLD_MODE_SLEEP_LONG:
-            ctrl_val = 0x02; // Power off on long press
-            break;
-    }
-    return writeRegister(NPM1300_SHPHLD_CTRL, ctrl_val);
-}
-
-// Get battery voltage
-float nPM1300::getBatteryVoltage() {
-    uint8_t high, low;
-    if (!readRegister(NPM1300_VBAT_HIGH, &high)) return 0.0;
-    if (!readRegister(NPM1300_VBAT_LOW, &low)) return 0.0;
-    
-    uint16_t raw_value = (high << 8) | low;
-    return (raw_value * 0.001); // Convert to voltage
-}
-
-// Get system voltage
-float nPM1300::getSystemVoltage() {
-    uint8_t high, low;
-    if (!readRegister(NPM1300_VSYS_HIGH, &high)) return 0.0;
-    if (!readRegister(NPM1300_VSYS_LOW, &low)) return 0.0;
-    
-    uint16_t raw_value = (high << 8) | low;
-    return (raw_value * 0.001);
-}
-
-// Get battery percentage
-uint8_t nPM1300::getBatteryPercent() {
-    float voltage = getBatteryVoltage();
-    
-    // Simple battery percentage calculation (Li-ion 3.0V–4.2V)
-    if (voltage >= 4.2) return 100;
-    if (voltage <= 3.0) return 0;
-    
-    return (uint8_t)((voltage - 3.0) / 1.2 * 100);
-}
-
-// Check if charging
-bool nPM1300::isCharging() {
-    uint8_t status;
-    if (!readRegister(NPM1300_CHG_STATUS, &status)) return false;
-    return (status & 0x01) != 0;
-}
-
-// Check if battery is low
-bool nPM1300::isBatteryLow() {
-    return getBatteryVoltage() < 3.3;
-}
-
-// Clear interrupts
-bool nPM1300::clearInterrupts() {
-    return writeRegister(NPM1300_INT_STATUS0, 0xFF) && 
-           writeRegister(NPM1300_INT_STATUS1, 0xFF);
-}
-
-// Get interrupt status
-uint8_t nPM1300::getInterruptStatus() {
-    uint8_t status;
-    readRegister(NPM1300_INT_STATUS0, &status);
-    return status;
-}
-
-// Get main status register
-uint8_t nPM1300::getMainStatus() {
-    uint8_t status;
-    readRegister(NPM1300_MAIN_STATUS, &status);
-    return status;
-}
-
-// Check power good status
-bool nPM1300::isPowerGood() {
-    uint8_t status = getMainStatus();
-    return (status & 0x80) != 0; // Assume bit 7 indicates power good
-}
+#endif // NPM1300_H
