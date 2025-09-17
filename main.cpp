@@ -1,220 +1,261 @@
-// nPM1300 Library for Arduino and nRF SDK/Zephyr RTOS
-// Author: Grok 4 (xAI) - Generated based on user specifications
-// Version: 1.0
-// Date: September 18, 2025
-//
-// This library provides a flexible interface to control the Nordic nPM1300 PMIC via I2C.
-// It supports configuration of Bucks, LDOs, Charger, GPIOs, and System Monitor (ADC) for measurements.
-// Fuel gauge is implemented as a simple voltage-based estimation with Coulomb counting for better accuracy (requires periodic updates).
-// Optimized for low power: Measurements are triggered on-demand, automatic modes disabled by default.
-// Compatible with:
-// - Arduino (using Wire.h)
-// - nRF SDK / Zephyr RTOS (using Zephyr I2C API; define USE_ZEPHYR to switch)
-//
-// Usage:
-// - Include this in your project.
-// - In examples, override defaults via setters.
-// - For Zephyr: Provide device tree overlay for I2C and define USE_ZEPHYR.
-//
-// Default Configurations (overridable):
-// - Buck1 and Buck2: 3.3V output
-// - LDO1: 3.3V enabled
-// - LDO2: Disabled
-// - Charger: 4.2V termination, suitable for 500mAh Li-Ion (adjust current limits as needed)
-// - GPIO1: INT (interrupt output)
-// - GPIO2: DRV2603_EN (output for enable)
-// - GPIO3: DRV2603_PWM (output for PWM)
-// - SHPHLD_B: Configured as power button (short press wake, long press shutdown)
-// - Battery Capacity: 500mAh (for fuel gauge)
-// - NTC: 10kOhm (default, configurable)
-//
-// Fuel Gauge Notes:
-// - Simple voltage-based SOC estimation with temperature compensation.
-// - Coulomb counting for current integration (update periodically in loop).
-// - Battery health (SOH) estimated based on cycle count and capacity fade (simplified model).
-//
-// Error Reporting: All functions return error codes (0 = success).
+// nPM1300.cpp
 
-#ifndef NPM1300_H
-#define NPM1300_H
-
-// Define USE_ZEPHYR for Zephyr RTOS compatibility
-// #define USE_ZEPHYR
+#include "nPM1300.h"
 
 #ifdef ARDUINO
-#include <Wire.h>
+#include <Arduino.h>
 #else
-// For nRF SDK or Zephyr, include appropriate headers
+// millis() placeholder for non-Arduino
+unsigned long millis() { /* Implement */ return 0; }
+#endif
+
+nPM1300::nPM1300() {
 #ifdef USE_ZEPHYR
-#include <zephyr/device.h>
-#include <zephyr/drivers/i2c.h>
+  i2c_dev = DEVICE_DT_GET(DT_NODELABEL(i2c0));  // Adjust for your device tree
+#endif
+}
+
+int nPM1300::init() {
+  // Default configs
+  setBuckVoltage(1, 3.3);
+  setBuckVoltage(2, 3.3);
+  setLdoVoltage(1, 3.3);
+  enableLdo(1, true);
+  enableLdo(2, false);
+  setChargeTermVoltage(4.2);
+  setChargeCurrent(100.0);  // 0.2C for 500mAh
+  setNtcResistance(NTC_10K);
+  configGpio1AsInt();
+  configGpio2AsDrvEn();
+  configGpio3AsDrvPwm();
+  configShphldAsPowerButton();
+  disableAutoMeasurements();  // Low power
+  return NPM_ERR_SUCCESS;
+}
+
+void nPM1300::setBuckVoltage(uint8_t buckNum, float voltage) {
+  uint8_t vset = (uint8_t)((voltage - 0.6) / 0.05);  // Example encoding; adjust per datasheet
+  uint8_t reg = (buckNum == 1) ? BUCK1_VSET : BUCK2_VSET;
+  i2cWrite(reg, vset);
+}
+
+void nPM1300::setLdoVoltage(uint8_t ldoNum, float voltage) {
+  uint8_t vset = (uint8_t)((voltage - 0.8) / 0.1);  // Example; adjust
+  uint8_t reg = (ldoNum == 1) ? LDO1_VSET : LDO2_VSET;
+  i2cWrite(reg, vset);
+}
+
+void nPM1300::enableLdo(uint8_t ldoNum, bool enable) {
+  uint8_t reg = (ldoNum == 1) ? LDO1_EN : LDO2_EN;
+  i2cWrite(reg, enable ? 0x01 : 0x00);
+}
+
+void nPM1300::setChargeTermVoltage(float voltage) {
+  uint8_t vterm = (uint8_t)((voltage - 3.5) / 0.05);  // Example
+  i2cWrite(CHG_TERM_VOLT, vterm);
+}
+
+void nPM1300::setChargeCurrent(float current_mA) {
+  uint8_t iset = (uint8_t)(current_mA / 10.0);  // Example scaling
+  i2cWrite(CHG_CURR_LIMIT, iset);
+}
+
+void nPM1300::setNtcResistance(NtcResistance res) {
+  ntcRes = res;
+  i2cWrite(ADC_NTC_RSEL, (uint8_t)res);
+}
+
+void nPM1300::setBatteryCapacity(float capacity_mAh) {
+  batteryCapacity_mAh = capacity_mAh;
+}
+
+void nPM1300::setNtcBeta(uint16_t beta) {
+  ntcBeta = beta;
+}
+
+void nPM1300::configGpio1AsInt() {
+  i2cWrite(GPIO1_CFG, 0x01);  // Example: Interrupt mode
+}
+
+void nPM1300::configGpio2AsDrvEn() {
+  i2cWrite(GPIO2_CFG, 0x02);  // Output enable
+}
+
+void nPM1300::configGpio3AsDrvPwm() {
+  i2cWrite(GPIO3_CFG, 0x03);  // PWM output
+}
+
+void nPM1300::configShphldAsPowerButton() {
+  i2cWrite(SHPHLD_CFG, 0x01);  // Enable short/long press detection
+}
+
+float nPM1300::getBatteryVoltage() {
+  triggerMeasurement(TASK_VBAT_MEASURE);
+  uint16_t adcVal = readAdcResult(ADC_VBAT_RESULT_MSB, ADC_GP0_RESULT_LSBS, 0);
+  return calculateVbat(adcVal);
+}
+
+float nPM1300::getBatteryCurrent() {
+  i2cWrite(ADC_IBAT_MEAS_EN, 0x01);  // Enable IBAT after VBAT
+  triggerMeasurement(TASK_IBAT_MEASURE);
+  uint16_t adcVal = readAdcResult(ADC_VBAT_RESULT_MSB, ADC_GP0_RESULT_LSBS, 0);  // Adjust for IBAT reg
+  uint8_t status;
+  i2cRead(ADC_IBAT_MEAS_STATUS, &status);
+  bool charging = (status & 0x02) == 0x02;  // Example bit check
+  if (status & 0x04) return NPM_ERR_INVALID_MEAS;  // Invalid flag
+  return calculateIbat(adcVal, charging);
+}
+
+float nPM1300::getBatteryTemperature() {
+  triggerMeasurement(TASK_NTC_MEASURE);
+  uint16_t adcVal = readAdcResult(ADC_NTC_RESULT_MSB, ADC_GP0_RESULT_LSBS, 0);
+  return calculateTbat(adcVal) - 273.15f;  // To Celsius
+}
+
+float nPM1300::getDieTemperature() {
+  triggerMeasurement(TASK_TEMP_MEASURE);
+  uint16_t adcVal = readAdcResult(ADC_TEMP_RESULT_MSB, ADC_GP0_RESULT_LSBS, 0);
+  return calculateTdie(adcVal);
+}
+
+float nPM1300::getVsysVoltage() {
+  triggerMeasurement(TASK_VSYS_MEASURE);
+  uint16_t adcVal = readAdcResult(ADC_VSYS_RESULT_MSB, ADC_GP0_RESULT_LSBS, 0);
+  return calculateVsys(adcVal);
+}
+
+float nPM1300::getVbusVoltage() {
+  triggerMeasurement(TASK_VBUS7_MEASURE);
+  uint16_t adcVal = readAdcResult(ADC_VBAT_RESULT_MSB, ADC_GP0_RESULT_LSBS, 0);  // VBUS in VBAT3?
+  return calculateVbus(adcVal);
+}
+
+float nPM1300::getStateOfCharge() {
+  float vbat = getBatteryVoltage();
+  float tbat = getBatteryTemperature();
+  // Simple voltage-based SOC with temp compensation
+  float soc = (vbat - 3.0) / (4.2 - 3.0) * 100.0;
+  soc -= (tbat > 25.0) ? (tbat - 25.0) * 0.1 : 0;  // Basic compensation
+  soc = max(0.0, min(100.0, soc));
+  return soc + (integratedCharge_mAh / batteryCapacity_mAh * 100.0);  // Adjust with Coulomb
+}
+
+float nPM1300::getStateOfHealth() {
+  // Simplified: 100% - (cycleCount * 0.05)% fade per cycle
+  return 100.0 - (cycleCount * 0.05);
+}
+
+void nPM1300::updateFuelGauge() {
+  float ibat = getBatteryCurrent();
+  unsigned long now = millis();
+  float deltaTime_h = (now - lastUpdateTime) / 3600000.0f;  // Hours
+  integratedCharge_mAh += ibat * deltaTime_h;
+  if (ibat > 0) cycleCount++;  // Increment on charge
+  lastUpdateTime = now;
+}
+
+int nPM1300::getChargeStatus() {
+  // Read charger status register (example)
+  uint8_t status = 0;
+  // i2cRead(CHG_STATUS, &status);  // Placeholder
+  return status;  // Map to 0/1/2/-1
+}
+
+float nPM1300::getChargeVoltage() {
+  return getVbat();  // Approximation
+}
+
+float nPM1300::getChargeCurrent() {
+  float ibat = getBatteryCurrent();
+  return (ibat > 0) ? ibat : 0;
+}
+
+int nPM1300::getLastError() {
+  // Read error register (placeholder)
+  return 0;
+}
+
+void nPM1300::triggerMeasurement(uint8_t taskReg) {
+  i2cWrite(taskReg, 0x01);  // Trigger
+  delay(1);  // Wait for conversion (250us typ, but safe)
+}
+
+uint16_t nPM1300::readAdcResult(uint8_t msbReg, uint8_t lsbReg, uint8_t lsbShift) {
+  uint8_t msb, lsbs;
+  i2cRead(msbReg, &msb);
+  i2cRead(lsbReg, &lsbs);
+  return (msb << 2) | ((lsbs >> lsbShift) & 0x03);  // 10-bit
+}
+
+float nPM1300::calculateVbat(uint16_t adcVal) {
+  return (adcVal / 1023.0f) * VFS_VBAT;
+}
+
+float nPM1300::calculateIbat(uint16_t adcVal, bool charging) {
+  float fs = charging ? 1.25 : 0.836;  // From datasheet
+  // Read ISET registers for full scale (placeholder)
+  return (adcVal / 1023.0f) * fs * 1000.0;  // mA
+}
+
+float nPM1300::calculateTbat(uint16_t adcVal) {
+  float tbat_adc = adcVal / 1023.0f;
+  return 1.0f / (1.0f / T0_KELVIN + (1.0f / ntcBeta) * log(1.0f / tbat_adc - 1.0f));
+}
+
+float nPM1300::calculateTdie(uint16_t adcVal) {
+  return 394.67f - 0.7926f * (adcVal / 1023.0f * VFS_TEMP);  // From equation
+}
+
+float nPM1300::calculateVsys(uint16_t adcVal) {
+  return (adcVal / 1023.0f) * VFS_VSYS;
+}
+
+float nPM1300::calculateVbus(uint16_t adcVal) {
+  return (adcVal / 1023.0f) * VFS_VBUS;
+}
+
+void nPM1300::disableAutoMeasurements() {
+  i2cWrite(ADC_CONFIG, 0x00);  // Disable auto
+  i2cWrite(TASK_AUTO_TIM_UPDATE, 0x00);
+}
+
+// I2C Implementations
+int nPM1300::i2cWrite(uint8_t reg, uint8_t val) {
+#ifdef ARDUINO
+  Wire.beginTransmission(NPM1300_I2C_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() ? NPM_ERR_I2C_FAIL : NPM_ERR_SUCCESS;
+#elif defined(USE_ZEPHYR)
+  uint8_t buf[2] = {reg, val};
+  return i2c_write(i2c_dev, buf, 2, NPM1300_I2C_ADDR);
 #else
-// nRF SDK placeholders (user to implement)
-#include <nrf_drv_twi.h>
+  // nRF SDK TWI implementation (user to fill)
+  return NPM_ERR_SUCCESS;
 #endif
+}
+
+int nPM1300::i2cRead(uint8_t reg, uint8_t* val) {
+#ifdef ARDUINO
+  Wire.beginTransmission(NPM1300_I2C_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(NPM1300_I2C_ADDR, 1);
+  if (Wire.available()) {
+    *val = Wire.read();
+    return NPM_ERR_SUCCESS;
+  }
+  return NPM_ERR_I2C_FAIL;
+#elif defined(USE_ZEPHYR)
+  return i2c_write_read(i2c_dev, NPM1300_I2C_ADDR, &reg, 1, val, 1);
+#else
+  // nRF SDK
+  return NPM_ERR_SUCCESS;
 #endif
+}
 
-// nPM1300 I2C Address
-#define NPM1300_I2C_ADDR 0x6B
+// Multi-byte versions similar (implement as needed)
 
-// Register Bases (from provided datasheet snippet)
-#define ADC_BASE 0x05  // High byte for ADC group (0x0500 internal, but I2C uses 8-bit reg addr)
 
-// Key Registers (extracted and generalized from datasheet)
-#define TASK_VBAT_MEASURE 0x00
-#define TASK_NTC_MEASURE 0x01
-#define TASK_TEMP_MEASURE 0x02
-#define TASK_VSYS_MEASURE 0x03
-#define TASK_IBAT_MEASURE 0x06
-#define TASK_VBUS7_MEASURE 0x07
-#define ADC_CONFIG 0x09
-#define ADC_NTC_RSEL 0x0A
-#define ADC_AUTO_TIM_CONF 0x0B
-#define TASK_AUTO_TIM_UPDATE 0x0C
-#define ADC_DEL_TIM_CONF 0x0D
-#define ADC_IBAT_MEAS_STATUS 0x10
-#define ADC_VBAT_RESULT_MSB 0x11
-#define ADC_NTC_RESULT_MSB 0x12
-#define ADC_TEMP_RESULT_MSB 0x13
-#define ADC_VSYS_RESULT_MSB 0x14
-#define ADC_GP0_RESULT_LSBS 0x15
-#define ADC_IBAT_MEAS_EN 0x24
-
-// Charger Registers (generalized; assume standard Nordic offsets - user to verify full datasheet)
-#define CHG_TERM_VOLT 0x20  // Example offset for termination voltage
-#define CHG_CURR_LIMIT 0x21 // Example for charge current
-
-// Buck/LDO Registers (example offsets; based on typical PMIC structure)
-#define BUCK1_VSET 0x30
-#define BUCK2_VSET 0x31
-#define LDO1_VSET 0x40
-#define LDO1_EN 0x41
-#define LDO2_VSET 0x42
-#define LDO2_EN 0x43
-
-// GPIO Registers
-#define GPIO1_CFG 0x50
-#define GPIO2_CFG 0x51
-#define GPIO3_CFG 0x52
-
-// SHPHLD_B Config (Power Button)
-#define SHPHLD_CFG 0x60  // Short press wake, long press shutdown
-
-// Constants from Datasheet
-#define VFS_VBAT 5.0f
-#define VFS_VBUS 7.5f
-#define VFS_VSYS 6.375f
-#define VFS_TEMP 1.5f
-#define T0_KELVIN 298.15f
-#define NTC_BETA_DEFAULT 3950  // Common for 10k NTC; configurable
-
-// Error Codes
-#define NPM_ERR_SUCCESS 0
-#define NPM_ERR_I2C_FAIL -1
-#define NPM_ERR_INVALID_MEAS -2
-
-// NTC Resistance Select
-enum NtcResistance {
-  NTC_HI_Z = 0,
-  NTC_10K = 1,
-  NTC_47K = 2,
-  NTC_100K = 3
-};
-
-// Measurement Modes
-enum MeasMode {
-  SINGLE_SHOT,
-  AUTO,
-  TIMED
-};
-
-class nPM1300 {
-public:
-  // Constructor
-  nPM1300();
-
-  // Initialization with defaults (call in setup())
-  int init();
-
-  // Setters for flexible configuration (override defaults)
-  void setBuckVoltage(uint8_t buckNum, float voltage);  // buckNum 1 or 2, voltage in V (e.g., 3.3)
-  void setLdoVoltage(uint8_t ldoNum, float voltage);    // ldoNum 1 or 2
-  void enableLdo(uint8_t ldoNum, bool enable);
-  void setChargeTermVoltage(float voltage);             // e.g., 4.2V
-  void setChargeCurrent(float current_mA);              // e.g., 100mA for 500mAh battery (0.2C)
-  void setNtcResistance(NtcResistance res);
-  void setBatteryCapacity(float capacity_mAh);          // For fuel gauge
-  void setNtcBeta(uint16_t beta);                       // NTC beta parameter
-
-  // GPIO Config
-  void configGpio1AsInt();
-  void configGpio2AsDrvEn();
-  void configGpio3AsDrvPwm();
-
-  // Power Button Config
-  void configShphldAsPowerButton();  // Short press wake, long press shutdown
-
-  // Measurements (low power: single-shot by default)
-  float getBatteryVoltage();         // VBAT in V
-  float getBatteryCurrent();         // IBAT in mA (positive charging, negative discharging)
-  float getBatteryTemperature();     // TBAT in C
-  float getDieTemperature();         // TDIE in C
-  float getVsysVoltage();            // VSYS in V
-  float getVbusVoltage();            // VBUS in V
-
-  // Fuel Gauge
-  float getStateOfCharge();          // SOC % (0-100)
-  float getStateOfHealth();          // SOH % (estimated)
-  void updateFuelGauge();            // Call periodically for Coulomb counting
-  int getChargeStatus();             // 0: Not charging, 1: Charging, 2: Full, -1: Error
-  float getChargeVoltage();          // Current charge voltage
-  float getChargeCurrent();          // Current charge current
-
-  // Error Reporting
-  int getLastError();                // Read error register or status
-
-private:
-  // I2C Abstraction
-  int i2cWrite(uint8_t reg, uint8_t val);
-  int i2cRead(uint8_t reg, uint8_t* val);
-  int i2cWriteMulti(uint8_t reg, uint8_t* data, size_t len);
-  int i2cReadMulti(uint8_t reg, uint8_t* data, size_t len);
-
-#ifdef USE_ZEPHYR
-  const struct device* i2c_dev;
-#endif
-
-  // Internal States for Fuel Gauge
-  float batteryCapacity_mAh = 500.0f;
-  float integratedCharge_mAh = 0.0f;  // For Coulomb counting
-  uint16_t cycleCount = 0;            // For SOH estimation
-  float lastIbat = 0.0f;
-  unsigned long lastUpdateTime = 0;
-  NtcResistance ntcRes = NTC_10K;
-  uint16_t ntcBeta = NTC_BETA_DEFAULT;
-
-  // Helper Functions
-  void triggerMeasurement(uint8_t taskReg);
-  uint16_t readAdcResult(uint8_t msbReg, uint8_t lsbReg, uint8_t lsbShift);
-  float calculateVbat(uint16_t adcVal);
-  float calculateIbat(uint16_t adcVal, bool charging);
-  float calculateTbat(uint16_t adcVal);
-  float calculateTdie(uint16_t adcVal);
-  float calculateVsys(uint16_t adcVal);
-  float calculateVbus(uint16_t adcVal);
-
-  // Low Power Optimizations
-  void disableAutoMeasurements();  // Disable auto for low power
-};
-
-// Example Usage (in Arduino sketch or main.c)
-// void setup() {
-//   nPM1300 pmic;
-//   pmic.init();
-//   // Override if needed
-//   // pmic.setBuckVoltage(1, 3.0);
-//   // pmic.enableLdo(2, true);
-//   // pmic.setLdoVoltage(2, 1.8);
-// }
-
-#endif // NPM1300_H
+// For Zephyr Optimization: Use low-power modes, disable unused peripherals in device tree.
+// Example Zephyr app: Integrate in prj.conf with CONFIG_I2C=y, and call init() in main.
