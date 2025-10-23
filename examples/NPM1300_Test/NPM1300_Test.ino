@@ -1,10 +1,3 @@
-/*
- * NPM1300 Test Example
- * 
- * This example demonstrates how to use the NPM1300 library
- * to read battery voltage, current, SOC and other information
- */
-
 #include <NPM1300.h>
 
 NPM1300 pmic;
