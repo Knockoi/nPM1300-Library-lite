@@ -23,7 +23,7 @@ SCL (Clock Line)
 
 ---
 
-## 🔧 I²C Structure in the NPM1300 Library
+##  I²C Structure in the NPM1300 Library
 
 ### 1. Initialize I²C
 
