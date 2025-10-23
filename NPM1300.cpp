@@ -1,7 +1,3 @@
-/*
- * NPM1300 Lite Arduino Library Implementation
- */
-
 #include "NPM1300.h"
 
 NPM1300::NPM1300(TwoWire &wirePort) {
