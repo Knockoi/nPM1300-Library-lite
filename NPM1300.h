@@ -1,8 +1,3 @@
-/*
- * NPM1300 Lite Arduino Library
- * Simple library for nPM1300 PMIC with BUCK converters
- */
-
 #ifndef NPM1300_H
 #define NPM1300_H
 
