@@ -58,9 +58,9 @@ bool NPM1300::begin() {
 
 ---
 
-## 📝 Three Core I²C Operations
+##  Three Core I²C Operations
 
-### 1️⃣ Write to Register
+### 1️ Write to Register
 
 ```cpp
 bool NPM1300::writeRegister(uint8_t reg, uint8_t value) {
@@ -91,7 +91,7 @@ I²C Bus: [START] → [0x6B] → [0x20] → [0x17] → [STOP]
 
 ---
 
-### 2️⃣ Read from Register
+### 2️ Read from Register
 
 ```cpp
 bool NPM1300::readRegister(uint8_t reg, uint8_t *value) {
@@ -128,7 +128,7 @@ I²C Bus:
 
 ---
 
-### 3️⃣ Read Multiple Registers
+### 3️ Read Multiple Registers
 
 ```cpp
 bool NPM1300::readRegisters(uint8_t reg, uint8_t *buffer, uint8_t len) {
@@ -165,7 +165,7 @@ voltage = (buffer[0] << 8) | buffer[1];
 
 ---
 
-## 🔍 Full Process Example
+##  Full Process Example
 
 ### Setting BUCK1 Voltage to 3.3V
 
@@ -207,7 +207,7 @@ START → 0x6B (Address) → 0x20 (Register) → 0x17 (Value) → STOP
 
 ---
 
-## 📊 Reading Battery Voltage Example
+##  Reading Battery Voltage Example
 
 ```cpp
 // User code
@@ -250,7 +250,7 @@ Read Phase:
 
 ---
 
-## 🎯 Key Concepts Summary
+##  Key Concepts Summary
 
 ### I²C Address
 ```cpp
@@ -278,9 +278,9 @@ uint16_t  voltage; // 16-bit data (2 bytes)
 
 ---
 
-## 🛠️ Practical Techniques
+##  Practical Techniques
 
-### 1️⃣ Check Device Connection
+### 1️ Check Device Connection
 ```cpp
 bool NPM1300::isConnected() {
     _i2c->beginTransmission(NPM1300_I2C_ADDR);
@@ -288,14 +288,14 @@ bool NPM1300::isConnected() {
 }
 ```
 
-### 2️⃣ Combine Two Bytes
+### 2️ Combine Two Bytes
 ```cpp
 uint8_t high = 0x0F;
 uint8_t low  = 0x0A;
 uint16_t value = (high << 8) | low;  // 0x0F0A = 3850
 ```
 
-### 3️⃣ Error Handling
+### 3️ Error Handling
 ```cpp
 bool NPM1300::readRegister(uint8_t reg, uint8_t *value) {
     _i2c->beginTransmission(NPM1300_I2C_ADDR);
@@ -316,7 +316,7 @@ bool NPM1300::readRegister(uint8_t reg, uint8_t *value) {
 
 ---
 
-## 💡 Complete Call Flow Diagram
+##  Complete Call Flow Diagram
 
 ```
 User calls
@@ -342,7 +342,7 @@ Return → 3850 mV
 
 ---
 
-## 🎓 Summary
+##  Summary
 
 ### The Role of I²C in the Library
 
