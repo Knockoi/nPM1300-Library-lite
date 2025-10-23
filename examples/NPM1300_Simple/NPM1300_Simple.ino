@@ -1,9 +1,3 @@
-/*
- * NPM1300 Simple Example (Arduino Style)
- * 
- * Ultra simple example using Arduino-style read/write functions
- */
-
 #include <NPM1300.h>
 
 NPM1300 pmic;
