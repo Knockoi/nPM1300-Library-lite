@@ -2,114 +2,149 @@
 The nPM1300 library is a lightweight C++ library for Nordic’s nPM1300 power management IC. It offers power control, battery management, and GPIO features, and works with both Arduino and nRF SDK. This makes it easy to integrate the nPM1300 into various embedded projects.
 
 ## How it work?
+### What Is I²C?
 
-## 1. What Is I²C?
+**Master (Arduino)** ←→ **Slave (nPM1300)**  
+```
+SDA (Data Line)
+SCL (Clock Line)
+```
 
-**I²C (Inter-Integrated Circuit)** is a **two-wire serial communication protocol** commonly used to connect a **microcontroller (master)** with **peripheral ICs (slaves)** such as sensors, PMICs, or EEPROMs.
+**Two-wire communication:**
+- `SDA` – Data line  
+- `SCL` – Clock line  
 
-| Line | Function | Description |
-|------|-----------|-------------|
-| **SDA** | Serial Data | Bi-directional data line |
-| **SCL** | Serial Clock | Clock signal controlled by the master |
+**Master–Slave architecture:**
+- Arduino = Master  
+- nPM1300 = Slave  
 
-### I²C Key Features
-- Two wires only (SDA & SCL)  
-- Multi-device shared bus (each has a unique 7-bit address)  
-- Master–slave architecture  
-- Byte-based data transmission with ACK/NACK signaling  
+**Address identification:**
+- Each device has a unique I²C address (e.g., `0x6B`)
 
 ---
 
-## 2. I²C Usage Inside a Library
+## 🔧 I²C Structure in the NPM1300 Library
 
-Taking an example of a PMIC driver (e.g., **nPM1300**), a library typically uses **Arduino’s `TwoWire` class** to handle I²C communication.
-
-### Example: Class Structure
+### 1. Initialize I²C
 
 ```cpp
 // NPM1300.h
 class NPM1300 {
-public:
-    bool begin();
-    uint16_t readVBAT();
-    uint8_t readSOC();
 private:
-    TwoWire *_i2c;  // Pointer to the I2C interface
+    TwoWire *_i2c;  // Pointer to the Wire object
 };
-```
 
-```cpp
 // NPM1300.cpp
 NPM1300::NPM1300(TwoWire &wirePort) {
-    _i2c = &wirePort;  // Store the I2C port reference
+    _i2c = &wirePort;  // Store the Wire object pointer
 }
 
 bool NPM1300::begin() {
-    _i2c->begin();     // Initialize I²C
-    return isConnected();
+    _i2c->begin();  // Start I²C communication
+    
+    if (!isConnected()) {
+        return false;  // Check if the device is present
+    }
+    
+    // Additional initialization...
 }
 ```
 
+**Why use `TwoWire`?**
+- `Wire` is the global Arduino I²C object.  
+- `TwoWire` is its class type.  
+- Some boards have multiple I²C ports (`Wire`, `Wire1`, `Wire2`).  
+- Using a pointer allows flexible I²C selection.
+
 ---
 
-## 3. Basic I²C Operations
+## 📝 Three Core I²C Operations
 
-Every I²C library function is ultimately built upon **three fundamental operations**:
-
-### 3.1 Write to a Register
+### 1️⃣ Write to Register
 
 ```cpp
 bool NPM1300::writeRegister(uint8_t reg, uint8_t value) {
-    _i2c->beginTransmission(NPM1300_I2C_ADDR);
-    _i2c->write(reg);      // Target register address
-    _i2c->write(value);    // Data to be written
-    return (_i2c->endTransmission() == 0);
+    // Step 1: Start transmission
+    _i2c->beginTransmission(NPM1300_I2C_ADDR);  // 0x6B
+    
+    // Step 2: Write register address
+    _i2c->write(reg);     // e.g., 0x20 (BUCK1_VOUT_SEL)
+    
+    // Step 3: Write value
+    _i2c->write(value);   // e.g., 0x17 (represents 3.3V)
+    
+    // Step 4: End transmission
+    return (_i2c->endTransmission() == 0);  // 0 = Success
 }
 ```
 
-📡 **Bus Activity:**
-```
-[START] → [0x6B + Write] → [Register Addr] → [Data] → [STOP]
+**Actual Usage:**
+```cpp
+pmic.writeBuck1(3.3);
+ ↓
+setBuck1Voltage(3.3);
+ ↓
+writeRegister(0x20, 0x17);
+ ↓
+I²C Bus: [START] → [0x6B] → [0x20] → [0x17] → [STOP]
 ```
 
 ---
 
-### 3.2 Read from a Register
+### 2️⃣ Read from Register
 
 ```cpp
 bool NPM1300::readRegister(uint8_t reg, uint8_t *value) {
-    // Step 1: Specify which register to read
+    // Step 1: Tell the device which register to read
     _i2c->beginTransmission(NPM1300_I2C_ADDR);
     _i2c->write(reg);
-    if (_i2c->endTransmission() != 0) return false;
-
-    // Step 2: Request 1 byte of data
-    if (_i2c->requestFrom(NPM1300_I2C_ADDR, (uint8_t)1) != 1) return false;
-
-    // Step 3: Read the received byte
+    if (_i2c->endTransmission() != 0) {
+        return false;
+    }
+    
+    // Step 2: Request 1 byte
+    if (_i2c->requestFrom(NPM1300_I2C_ADDR, (uint8_t)1) != 1) {
+        return false;
+    }
+    
+    // Step 3: Read received data
     *value = _i2c->read();
     return true;
 }
 ```
 
-📡 **Bus Activity:**
-```
-[START] → [0x6B + Write] → [Register Addr] → [STOP]
-[RESTART] → [0x6B + Read] → [Data Byte] → [STOP]
+**Actual Usage:**
+```cpp
+uint8_t soc = pmic.readSOC();
+ ↓
+getBatterySOC();
+ ↓
+readRegister(0x42, &value);
+ ↓
+I²C Bus:
+  [START] → [0x6B] → [0x42] → [STOP]
+  [START] → [0x6B] → [READ DATA] → [STOP]
 ```
 
 ---
 
-### 3.3 Read Multiple Registers
+### 3️⃣ Read Multiple Registers
 
 ```cpp
 bool NPM1300::readRegisters(uint8_t reg, uint8_t *buffer, uint8_t len) {
+    // Step 1: Specify starting register
     _i2c->beginTransmission(NPM1300_I2C_ADDR);
     _i2c->write(reg);
-    if (_i2c->endTransmission() != 0) return false;
-
-    if (_i2c->requestFrom(NPM1300_I2C_ADDR, len) != len) return false;
-
+    if (_i2c->endTransmission() != 0) {
+        return false;
+    }
+    
+    // Step 2: Request multiple bytes
+    if (_i2c->requestFrom(NPM1300_I2C_ADDR, len) != len) {
+        return false;
+    }
+    
+    // Step 3: Read in a loop
     for (uint8_t i = 0; i < len; i++) {
         buffer[i] = _i2c->read();
     }
@@ -117,134 +152,181 @@ bool NPM1300::readRegisters(uint8_t reg, uint8_t *buffer, uint8_t len) {
 }
 ```
 
-📡 **Example Bus Sequence:**
-```
-[START] → [0x6B + Write] → [0x32] → [STOP]
-[RESTART] → [0x6B + Read] → [0x0F] [0x0A] → [STOP]
+**Actual Usage:**
+```cpp
+uint16_t voltage = pmic.readVBAT();
+ ↓
+getVbatVoltage();
+ ↓
+readRegisters(0x32, buffer, 2);
+ ↓
+voltage = (buffer[0] << 8) | buffer[1];
 ```
 
 ---
 
-## 4. Practical Example – Reading Battery Voltage
+## 🔍 Full Process Example
+
+### Setting BUCK1 Voltage to 3.3V
 
 ```cpp
+// User code
+pmic.writeBuck1(3.3);
+
+// Layer 1: User-facing wrapper
+bool NPM1300::writeBuck1(float voltage) {
+    return setBuck1Voltage(voltage);
+}
+
+// Layer 2: Convert voltage to register value
+bool NPM1300::setBuck1Voltage(float voltage) {
+    uint8_t regValue = voltageToRegValue(voltage);
+    return writeRegister(NPM1300_BUCK1_VOUT_SEL, regValue);
+}
+
+// Layer 3: Conversion function
+uint8_t NPM1300::voltageToRegValue(float voltage) {
+    if (voltage < 1.0) voltage = 1.0;
+    if (voltage > 3.3) voltage = 3.3;
+    return (uint8_t)((voltage - 1.0) / 0.1);  // e.g., 3.3V → 0x17
+}
+
+// Layer 4: I²C Write
+bool NPM1300::writeRegister(uint8_t reg, uint8_t value) {
+    _i2c->beginTransmission(0x6B);
+    _i2c->write(0x20);  // BUCK1_VOUT_SEL
+    _i2c->write(0x17);  // Voltage value
+    return (_i2c->endTransmission() == 0);
+}
+```
+
+**Actual I²C Bus Signal:**
+```
+START → 0x6B (Address) → 0x20 (Register) → 0x17 (Value) → STOP
+```
+
+---
+
+## 📊 Reading Battery Voltage Example
+
+```cpp
+// User code
+uint16_t voltage = pmic.readVBAT();  // Returns 3850 mV
+
+// Layer 1
 uint16_t NPM1300::readVBAT() {
+    return getVbatVoltage();
+}
+
+// Layer 2
+uint16_t NPM1300::getVbatVoltage() {
     uint8_t buffer[2];
     if (readRegisters(0x32, buffer, 2)) {
-        return (buffer[0] << 8) | buffer[1]; // Merge high + low bytes
+        return (buffer[0] << 8) | buffer[1]; // 0x0F0A = 3850
     }
     return 0;
 }
-```
 
-**I²C Bus Trace:**
-```
-[START] → 0x6B(W) → 0x32 → [STOP]
-[RESTART] → 0x6B(R) → [High Byte] [Low Byte] → [STOP]
-```
-
-Result → `0x0F0A` = **3850 mV**
-
----
-
-## 5. Internal Abstraction Layers
-
-| Layer | Function | Example |
-|-------|-----------|----------|
-| **User API** | Simplified interface | `readVBAT()` |
-| **Driver Logic** | Converts values, calculates register mappings | `voltageToRegValue()` |
-| **I²C Access** | Low-level read/write implementation | `readRegister()`, `writeRegister()` |
-
-This layered approach isolates hardware details while keeping user APIs simple and consistent.
-
----
-
-## 6. Device Addressing and Registers
-
-```cpp
-#define NPM1300_I2C_ADDR            0x6B  // Device address
-#define NPM1300_BUCK1_VOUT_SEL      0x20  // Voltage control register
-#define NPM1300_BAT_SOC             0x42  // Battery state-of-charge
-```
-
-Each register corresponds to a **specific control or measurement parameter**.  
-Consult the **datasheet** to obtain all register maps and bit fields.
-
----
-
-## 7. Data Types Used in I²C Drivers
-
-### 7.1 Fixed-Width Integer Types
-
-| Type | Size | Range | Typical Usage |
-|------|------|--------|----------------|
-| `uint8_t` | 1 byte | 0–255 | I²C registers, small counters |
-| `int8_t` | 1 byte | −128–127 | Signed byte data |
-| `uint16_t` | 2 bytes | 0–65535 | Voltage (mV), time (ms) |
-| `int16_t` | 2 bytes | −32768–32767 | Signed current values |
-| `uint32_t` | 4 bytes | 0–4,294,967,295 | Timestamp, uptime |
-
-### 7.2 Why Use `uint8_t`?
-
-1. **Memory efficiency** — saves RAM on small MCUs.  
-2. **Register matching** — I²C transfers data 1 byte at a time.  
-3. **Platform consistency** — always 8 bits, unlike `int`.  
-4. **Predictable data size** — critical for low-level protocols.  
-
-Example:
-```cpp
-uint8_t reg = 0x20;   // Register address
-uint8_t value = 0xFF; // One-byte data
-```
-
----
-
-## 8. Device Connectivity Check
-
-```cpp
-bool NPM1300::isConnected() {
-    _i2c->beginTransmission(NPM1300_I2C_ADDR);
-    return (_i2c->endTransmission() == 0); // 0 = ACK received
+// Layer 3
+bool NPM1300::readRegisters(uint8_t reg, uint8_t *buffer, uint8_t len) {
+    _i2c->beginTransmission(0x6B);
+    _i2c->write(0x32);
+    _i2c->endTransmission();
+    
+    _i2c->requestFrom(0x6B, 2);
+    buffer[0] = _i2c->read();
+    buffer[1] = _i2c->read();
+    return true;
 }
 ```
 
-Used to verify that the target device is present and responding on the bus.
+**I²C Bus Signal:**
+```
+Write Phase:
+  START → 0x6B+W → 0x32 → STOP
+Read Phase:
+  START → 0x6B+R → [0x0F] → [0x0A] → STOP
+```
 
 ---
 
-## 9. Bit and Byte Manipulation
+## 🎯 Key Concepts Summary
 
-16-bit data from two registers:
+### I²C Address
+```cpp
+#define NPM1300_I2C_ADDR 0x6B
+```
+Each I²C device has a unique 7-bit address (`0x00–0x7F`).
+
+---
+
+### Registers
+```cpp
+#define NPM1300_BUCK1_VOUT_SEL  0x20  // BUCK1 voltage register
+#define NPM1300_BAT_SOC         0x42  // Battery state-of-charge register
+```
+Registers act like internal memory locations controlling different functions.
+
+---
+
+### Data Size
+```cpp
+uint8_t   reg;     // Register address (1 byte)
+uint8_t   value;   // Single data (1 byte)
+uint16_t  voltage; // 16-bit data (2 bytes)
+```
+
+---
+
+## 🛠️ Practical Techniques
+
+### 1️⃣ Check Device Connection
+```cpp
+bool NPM1300::isConnected() {
+    _i2c->beginTransmission(NPM1300_I2C_ADDR);
+    return (_i2c->endTransmission() == 0);  // 0 = success
+}
+```
+
+### 2️⃣ Combine Two Bytes
 ```cpp
 uint8_t high = 0x0F;
 uint8_t low  = 0x0A;
-uint16_t value = (high << 8) | low; // Combine into 0x0F0A
+uint16_t value = (high << 8) | low;  // 0x0F0A = 3850
+```
+
+### 3️⃣ Error Handling
+```cpp
+bool NPM1300::readRegister(uint8_t reg, uint8_t *value) {
+    _i2c->beginTransmission(NPM1300_I2C_ADDR);
+    _i2c->write(reg);
+    
+    if (_i2c->endTransmission() != 0) {
+        return false;
+    }
+    
+    if (_i2c->requestFrom(NPM1300_I2C_ADDR, 1) != 1) {
+        return false;
+    }
+    
+    *value = _i2c->read();
+    return true;
+}
 ```
 
 ---
 
-## 10. Summary
-
-| Concept | Description |
-|----------|--------------|
-| **I²C Address** | 7-bit identifier for each slave device |
-| **Register Address** | Memory location inside the IC |
-| **Data Transmission** | Byte by byte, MSB first |
-| **Library Role** | Abstraction layer hiding protocol details |
-| **Data Types** | Use `uint8_t`, `uint16_t` for consistency |
-| **Error Checking** | Return `false` if `endTransmission()` or `requestFrom()` fails |
-
----
-
-## 11. I²C Communication Flow Overview
+## 💡 Complete Call Flow Diagram
 
 ```
-User → pmic.readVBAT()
-        ↓
-Driver API → getVbatVoltage()
-        ↓
-Low-Level I²C → readRegisters(0x32, buffer, 2)
-        ↓
+User calls
+    ↓
+pmic.readVBAT()
+    ↓
+High-level wrapper → getVbatVoltage()
+    ↓
+Low-level I²C → readRegisters(0x32, buffer, 2)
+    ↓
 Bus Operations:
   beginTransmission(0x6B)
   write(0x32)
@@ -252,18 +334,32 @@ Bus Operations:
   requestFrom(0x6B, 2)
   buffer[0] = read()
   buffer[1] = read()
-        ↓
+    ↓
 Data Conversion → (buffer[0] << 8) | buffer[1]
-        ↓
-Return Result → 3850 mV
+    ↓
+Return → 3850 mV
 ```
 
 ---
 
-## 12. Final Takeaways
+## 🎓 Summary
 
-- **I²C acts as the bridge** between MCU and peripheral ICs.  
-- Libraries wrap I²C operations into **human-readable functions**.  
-- Using `uint8_t` ensures **data precision and platform independence**.  
-- Register-level access remains **transparent yet structured**.  
-- Abstraction layers help developers **focus on function, not protocol.**
+### The Role of I²C in the Library
+
+| Function | Description |
+|-----------|--------------|
+| **Bridge** | Connects Arduino and nPM1300 |
+| **Protocol** | Defines how they communicate (address → register → value) |
+| **Abstraction** | Wraps complex I²C operations into simple functions |
+
+### Three Core API Patterns
+
+| Type | Function |
+|------|-----------|
+| Write | `beginTransmission()` → `write()` → `endTransmission()` |
+| Read | `write(reg)` → `requestFrom()` → `read()` |
+| Data | `uint8_t` (1 byte per transfer) |
+
+---
+
+I²C enables structured, byte-level communication between MCU and peripheral ICs while the library encapsulates these low-level operations into clear, reusable APIs!!!
