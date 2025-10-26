@@ -157,6 +157,35 @@ bool disableCharger()
 ```
 Enable or disable battery charging.
 
+### GPIO Functions
+
+```cpp
+bool setGpioMode(uint8_t pin, uint8_t mode)
+```
+Set GPIO mode (pin: 0-4). Available modes:
+- `NPM1300_GPIO_INPUT` (0) - Input
+- `NPM1300_GPIO_OUT_LOGIC1` (8) - Output HIGH
+- `NPM1300_GPIO_OUT_LOGIC0` (9) - Output LOW
+- `NPM1300_GPIO_OUT_IRQ` (5) - Interrupt output
+- `NPM1300_GPIO_EVENT_RISE` (3) - Rising edge event
+- `NPM1300_GPIO_EVENT_FALL` (4) - Falling edge event
+
+```cpp
+bool setGpioOutput(uint8_t pin, bool state)
+```
+Set GPIO output HIGH or LOW.
+
+```cpp
+bool getGpioInput(uint8_t pin)
+```
+Read GPIO input state.
+
+```cpp
+bool setGpioPullUp(uint8_t pin, bool enable)
+bool setGpioPullDown(uint8_t pin, bool enable)
+```
+Enable or disable pull-up/pull-down resistors.
+
 ### Status Functions
 
 ```cpp
@@ -260,6 +289,41 @@ void loop() {
 }
 ```
 
+### GPIO Control
+
+```cpp
+#include <NPM1300.h>
+
+NPM1300 pmic;
+
+void setup() {
+    pmic.begin();
+    
+    // GPIO0 as output (LED)
+    pmic.setGpioMode(0, NPM1300_GPIO_OUT_LOGIC0);
+    
+    // GPIO1 as input (Button) with pull-up
+    pmic.setGpioMode(1, NPM1300_GPIO_INPUT);
+    pmic.setGpioPullUp(1, true);
+    
+    // GPIO2 as interrupt output
+    pmic.setGpioMode(2, NPM1300_GPIO_OUT_IRQ);
+}
+
+void loop() {
+    // Read button
+    bool buttonPressed = !pmic.getGpioInput(1);
+    
+    if (buttonPressed) {
+        // Toggle LED
+        static bool led = false;
+        led = !led;
+        pmic.setGpioOutput(0, led);
+        delay(200);  // Debounce
+    }
+}
+```
+
 ## Advanced API
 
 For users who prefer more descriptive function names, the library also provides:
@@ -276,24 +340,99 @@ Both naming styles are fully supported.
 
 ### Register Addresses
 
-The library uses the following default register addresses. Adjust according to your nPM1300 datasheet:
+The library uses 16-bit register addresses (Base Address + Offset) according to the nPM1300 datasheet:
 
-- BUCK1_VOUT_SEL: 0x20
-- BUCK2_VOUT_SEL: 0x21
-- VBAT_VOLTAGE: 0x32
-- BAT_SOC: 0x42
+**BUCK Registers (Base: 0x0400)**
+- BUCK1ENASET: 0x0400
+- BUCK1NORMVOUT: 0x0408
+- BUCK2NORMVOUT: 0x040A
+- BUCKSWCTRLSEL: 0x040F
+
+**Charger Registers (Base: 0x0300)**
+- BCHGENABLESET: 0x0304
+- BCHGISETMSB: 0x0308
+- BCHGVTERM: 0x030C
+- BCHGCHARGESTATUS: 0x0334
+
+**ADC Registers (Base: 0x0500)**
+- TASK_VBAT_MEAS: 0x0500
+- ADC_VBAT_MSB: 0x0511
+- ADC_GP0_LSBS: 0x0515
 
 ### Voltage Conversion
 
-BUCK voltage range is 1.0V to 3.3V with 0.1V steps. The conversion formula:
+BUCK voltage range is 1.0V to 3.3V with 0.1V steps:
+- Register value 0 = 1.0V
+- Register value 23 = 3.3V
+- Formula: Register Value = (Voltage - 1.0) / 0.1
 
+### Charge Current Configuration
+
+Charging current range: 32 mA to 800 mA with 2 mA steps
+- BCHGISETMSB = Current_mA / 2
+- BCHGISETLSB = Current_mA % 2
+
+Example: 100 mA → ISETMSB = 50, ISETLSB = 0
+
+### Charge Voltage Options
+
+Termination voltage options (BCHGVTERM register):
+- 3.50V, 3.55V, 3.60V, 3.65V
+- 4.00V to 4.45V in 50mV steps
+
+### ADC Conversion
+
+The nPM1300 uses a 10-bit ADC with different voltage ranges:
+- VBAT: (ADC_value * 5000) / 1024 mV (0-5V range)
+- VBUS: (ADC_value * 7500) / 1024 mV (0-7.5V range)
+- VSYS: (ADC_value * 6375) / 1024 mV (0-6.375V range)
+
+ADC conversion time: approximately 250 microseconds
+
+### Battery SOC
+
+Note: The nPM1300 does not have built-in State of Charge calculation. The `readSOC()` function provides a simple voltage-based estimation. For accurate SOC measurement, use the Nordic nRF Connect SDK fuel gauge algorithm with the nPM1300.
+
+### I2C Communication
+
+I2C address: 0x6B (7-bit)
+
+Register access uses 16-bit addressing:
 ```
-Register Value = (Voltage - 1.0) / 0.1
+[Slave Address][High Byte][Low Byte][Data]
+     0x6B         0x04        0x08     0x17
 ```
 
-### I2C Address
+### BUCK Control Sequence
 
-Default I2C address is 0x6B. To change it, modify `NPM1300_I2C_ADDR` in `NPM1300.h`.
+To change BUCK voltage:
+1. Write voltage value to BUCK1NORMVOUT/BUCK2NORMVOUT
+2. Set BUCKSWCTRLSEL register to enable software control
+3. The library handles this automatically in `writeBuck1()` and `writeBuck2()`
+
+### GPIO Configuration
+
+The nPM1300 has 5 GPIO pins (GPIO0-GPIO4) that can be configured for various functions:
+
+**GPIO Modes:**
+- Input (with pull-up/pull-down)
+- Output (logic high/low)
+- Interrupt output
+- Edge detection (rising/falling)
+- BUCK control
+- Load switch control
+
+**GPIO Register Base:** 0x0600
+
+Each GPIO has individual registers for:
+- Mode (offset 0x00-0x04)
+- Drive strength (offset 0x05-0x09)
+- Pull-up enable (offset 0x0A-0x0E)
+- Pull-down enable (offset 0x0F-0x13)
+- Open drain (offset 0x14-0x18)
+- Debounce (offset 0x19-0x1D)
+
+GPIO status can be read from register 0x061E.
 
 ## Compatibility
 
